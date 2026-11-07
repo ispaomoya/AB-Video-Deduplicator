@@ -3,8 +3,8 @@ import sys
 import cv2
 import time
 import ffmpeg
-import itertools
 import subprocess
+import tempfile
 import numpy as np
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -129,9 +129,15 @@ QLabel {
 }
 """
 
+def bundled_tool(name):
+    executable = name + ('.exe' if sys.platform == 'win32' else '')
+    root = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    candidate = os.path.join(root, 'bin', executable)
+    return candidate if os.path.isfile(candidate) else name
+
 def get_video_info(video_path):
     try:
-        probe = ffmpeg.probe(video_path, cmd='ffprobe')
+        probe = ffmpeg.probe(video_path, cmd=bundled_tool('ffprobe'))
         video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
         if not video_stream:
             raise ValueError("未找到视频流")
@@ -184,7 +190,7 @@ def resize_video(input_path, output_path, width, height, use_gpu=False):
     encoder = 'h264_nvenc' if use_gpu else 'libx264'
     quality_param = '-preset p6' if use_gpu else '-crf 23'
     cmd_list = [
-        'ffmpeg', '-y', '-i', input_path,
+        bundled_tool('ffmpeg'), '-y', '-i', input_path,
         '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2',
         '-c:v', encoder,
     ]
@@ -207,7 +213,7 @@ def resize_video(input_path, output_path, width, height, use_gpu=False):
 
 def frame_reader(video_path, width, height):
     command = [
-        'ffmpeg', '-i', video_path,
+        bundled_tool('ffmpeg'), '-i', video_path,
         '-f', 'image2pipe', '-pix_fmt', 'bgr24', '-vcodec', 'rawvideo', '-'
     ]
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
@@ -298,7 +304,7 @@ class VideoProcessor(QThread):
             encoder = 'h264_nvenc' if self.use_gpu else 'libx264'
             quality_param = '-preset p6' if self.use_gpu else '-crf 23'
             writer_cmd = [
-                'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                bundled_tool('ffmpeg'), '-hide_banner', '-loglevel', 'error', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
                 '-pix_fmt', 'bgr24', '-s', f'{width_a}x{height_a}', '-r', str(self.fps),
                 '-i', '-', '-c:v', encoder
             ]
@@ -317,7 +323,6 @@ class VideoProcessor(QThread):
             try:
                 reader_a_gen = frame_reader(self.video_a_path, width_a, height_a)
                 reader_b_gen = frame_reader(path_b_to_process, width_a, height_a)
-                reader_b_cycled = itertools.cycle(reader_b_gen)
                 a_frame_counter = 0
                 for i in range(total_frames_c):
                     frame_to_write = None
@@ -326,7 +331,12 @@ class VideoProcessor(QThread):
                             frame_to_write = next(reader_a_gen)
                             a_frame_counter += 1
                         else:
-                            frame_to_write = next(reader_b_cycled)
+                            try:
+                                frame_to_write = next(reader_b_gen)
+                            except StopIteration:
+                                reader_b_gen.close()
+                                reader_b_gen = frame_reader(path_b_to_process, width_a, height_a)
+                                frame_to_write = next(reader_b_gen)
                         writer_process.stdin.write(frame_to_write.tobytes())
                         if (i + 1) % 50 == 0 or (i + 1) == total_frames_c:
                             progress = 20 + int(70 * (i + 1) / total_frames_c)
@@ -342,13 +352,14 @@ class VideoProcessor(QThread):
                     reader_b_gen.close()
             self.status.emit(f"混合完成，正在生成最终视频文件... (t={time.time() - start_time:.2f}s)")
             writer_process.stdin.close()
+            writer_process.stdin = None
             _, stderr_output = writer_process.communicate()
             if writer_process.returncode != 0:
                 raise RuntimeError(f"FFmpeg写入视频失败: {stderr_output.decode('utf-8', errors='ignore')}")
             self.progress.emit(90)
             self.status.emit(f"合并音频... (t={time.time() - start_time:.2f}s)")
             final_cmd = [
-                'ffmpeg', '-y', '-i', temp_output_path, '-i', self.video_a_path,
+                bundled_tool('ffmpeg'), '-y', '-i', temp_output_path, '-i', self.video_a_path,
                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', self.output_path
             ]
             subprocess.run(
@@ -492,9 +503,7 @@ class MainWindow(QMainWindow):
         self.video_a_path = ""
         self.video_b_path = ""
         self.output_path = ""
-        self.temp_dir = os.path.join(os.path.expanduser("~"), ".video_temp_optimized")
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
+        self.temp_dir = tempfile.mkdtemp(prefix='ab-video-')
 
     def select_video_a(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择视频A", "", "视频文件 (*.mp4 *.avi *.mov)")
